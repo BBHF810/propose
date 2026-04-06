@@ -6,10 +6,11 @@ interface PresentationViewProps {
   gameState: GameState;
   myPlayerId: string;
   isHost: boolean;
+  isJudge: boolean;
   onNextPresenter: () => void;
 }
 
-export default function PresentationView({ gameState, myPlayerId, isHost, onNextPresenter }: PresentationViewProps) {
+export default function PresentationView({ gameState, myPlayerId, isHost, isJudge, onNextPresenter }: PresentationViewProps) {
   const presenter = gameState.players[gameState.currentPresenterIndex];
   const judge = gameState.players[gameState.currentJudgeIndex];
   const proposal = gameState.proposals.get(presenter?.id || '');
@@ -45,14 +46,14 @@ export default function PresentationView({ gameState, myPlayerId, isHost, onNext
         </div>
       </div>
 
-      {isHost && (
+      {(isHost || isJudge) && (
         <button className="btn-primary next-btn" onClick={onNextPresenter}>
           次の発表へ ▶
         </button>
       )}
 
-      {!isHost && (
-        <p className="wait-text">ホストが次に進めるのを待っています...</p>
+      {!(isHost || isJudge) && (
+        <p className="wait-text">ホストまたは親が進めるのを待っています...</p>
       )}
 
       <style jsx>{`

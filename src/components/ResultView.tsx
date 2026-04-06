@@ -7,10 +7,11 @@ interface ResultViewProps {
   gameState: GameState;
   myPlayerId: string;
   isHost: boolean;
+  isJudge: boolean;
   onNextRound: () => void;
 }
 
-export default function ResultView({ gameState, myPlayerId, isHost, onNextRound }: ResultViewProps) {
+export default function ResultView({ gameState, myPlayerId, isHost, isJudge, onNextRound }: ResultViewProps) {
   const winner = gameState.players.find(p => p.id === gameState.selectedWinner);
   const judge = gameState.players[gameState.currentJudgeIndex];
   const winnerProposal = gameState.proposals.get(gameState.selectedWinner || '');
@@ -98,17 +99,17 @@ export default function ResultView({ gameState, myPlayerId, isHost, onNextRound 
         </div>
       </div>
 
-      {isHost && (
+      {(isHost || isJudge) && (
         <button className="btn-gold next-round-btn" onClick={onNextRound}>
           {isLastRound ? '🏆 最終結果を見る' : '▶ 次のラウンドへ'}
         </button>
       )}
 
-      {!isHost && (
+      {!(isHost || isJudge) && (
         <p className="wait-text">
           {isLastRound 
-            ? 'ホストが最終結果を表示するのを待っています...' 
-            : 'ホストが次のラウンドを開始するのを待っています...'
+            ? 'ホストまたは親が最終結果を表示するのを待っています...' 
+            : 'ホストまたは親が次のラウンドを開始するのを待っています...'
           }
         </p>
       )}

@@ -110,6 +110,26 @@ export default function Home() {
           peerRef.current?.broadcastGameState(newState);
           break;
         }
+        case 'next-presenter': {
+          newState = nextPresenter(prev);
+          peerRef.current?.broadcastGameState(newState);
+          break;
+        }
+        case 'select-winner': {
+          if ('winnerId' in msg) {
+            newState = selectWinner(prev, msg.winnerId);
+            peerRef.current?.broadcastGameState(newState);
+          }
+          break;
+        }
+        case 'next-round': {
+          newState = nextRound(prev);
+          peerRef.current?.broadcastGameState(newState);
+          if (newState.phase === 'composing') {
+            startTimer();
+          }
+          break;
+        }
         default:
           break;
       }
@@ -254,30 +274,42 @@ export default function Home() {
     }
   }, [gameState, isHost, myPlayerId]);
 
-  // Next presenter (host only)
+  // Next presenter (host/judge only)
   const handleNextPresenter = useCallback(() => {
-    if (!gameState || !isHost) return;
-    const newState = nextPresenter(gameState);
-    setGameState(newState);
-    peerRef.current?.broadcastGameState(newState);
+    if (!gameState) return;
+    if (isHost) {
+      const newState = nextPresenter(gameState);
+      setGameState(newState);
+      peerRef.current?.broadcastGameState(newState);
+    } else {
+      peerRef.current?.sendToHost({ type: 'next-presenter' });
+    }
   }, [gameState, isHost]);
 
   // Select winner (host/judge only)
   const handleSelectWinner = useCallback((winnerId: string) => {
-    if (!gameState || !isHost) return;
-    const newState = selectWinner(gameState, winnerId);
-    setGameState(newState);
-    peerRef.current?.broadcastGameState(newState);
+    if (!gameState) return;
+    if (isHost) {
+      const newState = selectWinner(gameState, winnerId);
+      setGameState(newState);
+      peerRef.current?.broadcastGameState(newState);
+    } else {
+      peerRef.current?.sendToHost({ type: 'select-winner', winnerId });
+    }
   }, [gameState, isHost]);
 
-  // Next round (host only)
+  // Next round (host/judge only)
   const handleNextRound = useCallback(() => {
-    if (!gameState || !isHost) return;
-    const newState = nextRound(gameState);
-    setGameState(newState);
-    peerRef.current?.broadcastGameState(newState);
-    if (newState.phase === 'composing') {
-      startTimer();
+    if (!gameState) return;
+    if (isHost) {
+      const newState = nextRound(gameState);
+      setGameState(newState);
+      peerRef.current?.broadcastGameState(newState);
+      if (newState.phase === 'composing') {
+        startTimer();
+      }
+    } else {
+      peerRef.current?.sendToHost({ type: 'next-round' });
     }
   }, [gameState, isHost, startTimer]);
 
@@ -338,6 +370,7 @@ export default function Home() {
             gameState={gameState}
             myPlayerId={myPlayerId}
             isHost={isHost}
+            isJudge={isJudge}
             onNextPresenter={handleNextPresenter}
           />
         );
@@ -359,6 +392,7 @@ export default function Home() {
             gameState={gameState}
             myPlayerId={myPlayerId}
             isHost={isHost}
+            isJudge={isJudge}
             onNextRound={handleNextRound}
           />
         );
