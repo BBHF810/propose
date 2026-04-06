@@ -1,86 +1,77 @@
 'use client';
 
-import Peer, { DataConnection } from 'peerjs';
+import { createClient, SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
 import { PeerMessage, GameState, serializeGameState } from './gameState';
 
 type MessageHandler = (msg: PeerMessage, senderId: string) => void;
-type ConnectionHandler = (peerId: string) => void;
-type DisconnectionHandler = (peerId: string) => void;
+type ConnectionHandler = (playerId: string) => void;
+type DisconnectionHandler = (playerId: string) => void;
 
-const PEER_PREFIX = 'propgame-';
-
-// PeerJSの共通設定
-const PEER_CONFIG = {
-  debug: 2,
-  config: {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' },
-      { urls: 'stun:stun.services.mozilla.com' },
-    ],
-  },
-};
+// Supabase設定（環境変数から取得）
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
 export class PeerManager {
-  private peer: Peer | null = null;
-  private connections: Map<string, DataConnection> = new Map();
+  private supabase: SupabaseClient | null = null;
+  private channel: RealtimeChannel | null = null;
   private onMessage: MessageHandler | null = null;
   private onConnect: ConnectionHandler | null = null;
   private onDisconnect: DisconnectionHandler | null = null;
   private isHost: boolean = false;
   private myPeerId: string = '';
-  private pingInterval: ReturnType<typeof setInterval> | null = null;
-  private destroyed: boolean = false;
+  private roomId: string = '';
+
+  private generateId(): string {
+    return 'player-' + Math.random().toString(36).substring(2, 10);
+  }
+
+  // Supabaseクライアント初期化
+  private initSupabase() {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      throw new Error('Supabase設定が見つかりません。');
+    }
+    this.supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  }
 
   // ホストとして初期化
   async initAsHost(roomId: string): Promise<string> {
     this.isHost = true;
-    const peerId = PEER_PREFIX + roomId;
-    this.myPeerId = peerId;
+    this.roomId = roomId;
+    this.myPeerId = 'host-' + roomId;
+
+    this.initSupabase();
 
     return new Promise((resolve, reject) => {
-      let resolved = false;
+      const channelName = `propose-${roomId}`;
+      console.log('[Host] Creating channel:', channelName);
 
-      this.peer = new Peer(peerId, PEER_CONFIG);
-
-      this.peer.on('open', (id) => {
-        if (resolved) return;
-        resolved = true;
-        console.log('[Host] Peer opened:', id);
-        this.startPingInterval();
-        resolve(id);
+      this.channel = this.supabase!.channel(channelName, {
+        config: {
+          broadcast: { self: false },
+        },
       });
 
-      this.peer.on('connection', (conn) => {
-        console.log('[Host] Incoming connection from:', conn.peer);
-        this.handleConnection(conn);
-      });
-
-      this.peer.on('error', (err: any) => {
-        console.error('[Host] Peer error:', err.type, err.message);
-        if (!resolved) {
-          resolved = true;
-          if (err.type === 'unavailable-id') {
-            reject(new Error('この部屋コードは既に使われています。別のコードをお試しください。'));
-          } else {
-            reject(new Error(`接続エラー: ${err.type || err.message}`));
+      // メッセージ受信ハンドラ
+      this.channel
+        .on('broadcast', { event: 'game-message' }, (payload) => {
+          const msg = payload.payload as { message: PeerMessage; senderId: string };
+          console.log('[Host] Received:', msg.message.type, 'from:', msg.senderId);
+          this.onMessage?.(msg.message, msg.senderId);
+        })
+        .subscribe((status) => {
+          console.log('[Host] Channel status:', status);
+          if (status === 'SUBSCRIBED') {
+            console.log('[Host] Channel ready');
+            resolve(this.myPeerId);
+          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+            reject(new Error('チャンネルへの接続に失敗しました。'));
           }
-        }
-      });
-
-      this.peer.on('disconnected', () => {
-        console.log('[Host] Disconnected from signaling server, attempting reconnect...');
-        if (!this.destroyed && this.peer) {
-          this.peer.reconnect();
-        }
-      });
+        });
 
       // タイムアウト
       setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          reject(new Error('シグナリングサーバーへの接続がタイムアウトしました。'));
+        if (!this.channel) {
+          reject(new Error('接続がタイムアウトしました。'));
         }
       }, 15000);
     });
@@ -89,158 +80,77 @@ export class PeerManager {
   // クライアントとして接続
   async initAsClient(roomId: string): Promise<string> {
     this.isHost = false;
-    const hostPeerId = PEER_PREFIX + roomId;
+    this.roomId = roomId;
+    this.myPeerId = this.generateId();
+
+    this.initSupabase();
 
     return new Promise((resolve, reject) => {
-      let resolved = false;
+      const channelName = `propose-${roomId}`;
+      console.log('[Client] Joining channel:', channelName);
 
-      this.peer = new Peer(PEER_CONFIG);
+      this.channel = this.supabase!.channel(channelName, {
+        config: {
+          broadcast: { self: false },
+        },
+      });
 
-      this.peer.on('open', (id) => {
-        console.log('[Client] Peer opened:', id);
-        this.myPeerId = id;
-
-        console.log('[Client] Connecting to host:', hostPeerId);
-        // ホストに接続
-        const conn = this.peer!.connect(hostPeerId, {
-          reliable: true,
-          serialization: 'json',
-        });
-
-        conn.on('open', () => {
-          if (resolved) return;
-          resolved = true;
-          console.log('[Client] Connected to host successfully');
-          this.connections.set(hostPeerId, conn);
-          this.setupConnectionHandlers(conn);
-          this.startPingInterval();
-          resolve(id);
-        });
-
-        conn.on('error', (err) => {
-          console.error('[Client] Connection error:', err);
-          if (!resolved) {
-            resolved = true;
-            reject(new Error('部屋に接続できませんでした。部屋コードを確認してください。'));
+      // メッセージ受信ハンドラ
+      this.channel
+        .on('broadcast', { event: 'game-message' }, (payload) => {
+          const msg = payload.payload as { message: PeerMessage; senderId: string };
+          console.log('[Client] Received:', msg.message.type, 'from:', msg.senderId);
+          this.onMessage?.(msg.message, msg.senderId);
+        })
+        .subscribe((status) => {
+          console.log('[Client] Channel status:', status);
+          if (status === 'SUBSCRIBED') {
+            console.log('[Client] Channel ready');
+            resolve(this.myPeerId);
+          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+            reject(new Error('部屋に接続できませんでした。'));
           }
         });
 
-        // 接続タイムアウト
-        setTimeout(() => {
-          if (!resolved) {
-            resolved = true;
-            console.error('[Client] Connection timeout. conn.open:', conn.open);
-            reject(new Error('接続がタイムアウトしました。部屋コードを確認してください。'));
-          }
-        }, 15000);
-      });
-
-      this.peer.on('error', (err: any) => {
-        console.error('[Client] Peer error:', err.type, err.message);
-        if (!resolved) {
-          resolved = true;
-          if (err.type === 'peer-unavailable') {
-            reject(new Error('部屋が見つかりません。部屋コードを確認してください。'));
-          } else {
-            reject(new Error(`接続エラー: ${err.type || err.message}`));
-          }
-        }
-      });
-
-      this.peer.on('disconnected', () => {
-        console.log('[Client] Disconnected from signaling server');
-        if (!this.destroyed && this.peer) {
-          this.peer.reconnect();
-        }
-      });
-
-      // Peer自体のオープンタイムアウト
+      // タイムアウト
       setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          reject(new Error('シグナリングサーバーに接続できませんでした。ネットワークを確認してください。'));
+        if (!this.channel) {
+          reject(new Error('接続がタイムアウトしました。'));
         }
-      }, 20000);
+      }, 15000);
     });
   }
 
-  private handleConnection(conn: DataConnection) {
-    // 着信接続がすでにopenの場合があるので両方対応する
-    const setup = () => {
-      if (this.connections.has(conn.peer)) return; // 重複防止
-      console.log('[PeerManager] Setting up connection with:', conn.peer, 'open:', conn.open);
-      this.connections.set(conn.peer, conn);
-      this.setupConnectionHandlers(conn);
-      this.onConnect?.(conn.peer);
-    };
+  // メッセージ送信（ブロードキャスト）
+  async send(_peerId: string, msg: PeerMessage) {
+    await this.broadcast(msg);
+  }
 
-    if (conn.open) {
-      console.log('[PeerManager] Connection already open:', conn.peer);
-      setup();
+  // ブロードキャスト
+  async broadcast(msg: PeerMessage) {
+    if (!this.channel) {
+      console.warn('[PeerManager] No channel to broadcast to');
+      return;
     }
-    conn.on('open', () => {
-      console.log('[PeerManager] Connection opened:', conn.peer);
-      setup();
-    });
-  }
-
-  private setupConnectionHandlers(conn: DataConnection) {
-    conn.on('data', (data) => {
-      const msg = data as PeerMessage;
-      if (msg.type === 'ping') {
-        this.send(conn.peer, { type: 'pong' });
-        return;
-      }
-      if (msg.type === 'pong') return;
-      console.log('[PeerManager] Received message:', msg.type, 'from:', conn.peer);
-      this.onMessage?.(msg, conn.peer);
-    });
-
-    conn.on('close', () => {
-      console.log('[PeerManager] Connection closed:', conn.peer);
-      this.connections.delete(conn.peer);
-      this.onDisconnect?.(conn.peer);
-    });
-
-    conn.on('error', (err) => {
-      console.error('[PeerManager] Connection error with', conn.peer, err);
-    });
-  }
-
-  // 特定のピアにメッセージ送信
-  send(peerId: string, msg: PeerMessage) {
-    const conn = this.connections.get(peerId);
-    if (conn && conn.open) {
-      conn.send(msg);
-    } else {
-      console.warn('[PeerManager] Cannot send to', peerId, '- connection not open');
-    }
-  }
-
-  // 全ピアにブロードキャスト
-  broadcast(msg: PeerMessage) {
-    this.connections.forEach((conn, peerId) => {
-      if (conn.open) {
-        conn.send(msg);
-      }
+    await this.channel.send({
+      type: 'broadcast',
+      event: 'game-message',
+      payload: {
+        message: msg,
+        senderId: this.myPeerId,
+      },
     });
   }
 
   // ゲーム状態をブロードキャスト（ホスト用）
-  broadcastGameState(state: GameState) {
+  async broadcastGameState(state: GameState) {
     const serialized = serializeGameState(state);
-    this.broadcast({ type: 'game-state', state: serialized });
+    await this.broadcast({ type: 'game-state', state: serialized });
   }
 
-  // ホストにメッセージ送信（クライアント用）
-  sendToHost(msg: PeerMessage) {
-    const hostConn = Array.from(this.connections.values())[0];
-    if (hostConn && hostConn.open) {
-      console.log('[Client] Sending to host:', msg.type);
-      hostConn.send(msg);
-    } else {
-      console.warn('[Client] Cannot send to host - no open connection');
-    }
+  // ホストにメッセージ送信（クライアント用）— Broadcastではすべてブロードキャスト
+  async sendToHost(msg: PeerMessage) {
+    await this.broadcast(msg);
   }
 
   // イベントハンドラ設定
@@ -256,23 +166,13 @@ export class PeerManager {
     this.onDisconnect = handler;
   }
 
-  // Keep-alive
-  private startPingInterval() {
-    this.pingInterval = setInterval(() => {
-      this.broadcast({ type: 'ping' });
-    }, 15000);
-  }
-
   // 切断
   destroy() {
-    this.destroyed = true;
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
+    if (this.channel && this.supabase) {
+      this.supabase.removeChannel(this.channel);
     }
-    this.connections.forEach(conn => conn.close());
-    this.connections.clear();
-    this.peer?.destroy();
-    this.peer = null;
+    this.channel = null;
+    this.supabase = null;
   }
 
   getPeerId(): string {
@@ -284,6 +184,6 @@ export class PeerManager {
   }
 
   getConnectionCount(): number {
-    return this.connections.size;
+    return 0; // Broadcastでは直接的な接続数は取得不可
   }
 }
