@@ -12,7 +12,6 @@ import JudgeView from '@/components/JudgeView';
 import ResultView from '@/components/ResultView';
 import GameOverView from '@/components/GameOverView';
 import Particles from '@/components/Particles';
-import styles from './page.module.css';
 
 export default function Home() {
   const [gameState, setGameState] = useState<GameState | null>(null);
@@ -22,12 +21,17 @@ export default function Home() {
   const [isConnecting, setIsConnecting] = useState(false);
   const peerRef = useRef<PeerManager | null>(null);
   const gameStateRef = useRef<GameState | null>(null);
+  const myPlayerIdRef = useRef<string>('');
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Keep gameStateRef in sync
+  // Keep refs in sync
   useEffect(() => {
     gameStateRef.current = gameState;
   }, [gameState]);
+
+  useEffect(() => {
+    myPlayerIdRef.current = myPlayerId;
+  }, [myPlayerId]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -59,27 +63,38 @@ export default function Home() {
     }, 1000);
   }, []);
 
-  // Host message handler
+  // Host message handler — uses refs to avoid stale closures
   const handleHostMessage = useCallback((msg: PeerMessage, senderId: string) => {
+    if (msg.type === 'player-join') {
+      // Handle player-join outside setGameState to properly broadcast after state updates
+      setGameState(prev => {
+        if (!prev) return prev;
+        const existingPlayer = prev.players.find(p => p.id === msg.player.id);
+        if (existingPlayer) {
+          // Player already exists, just broadcast current state
+          setTimeout(() => {
+            peerRef.current?.broadcastGameState(gameStateRef.current!);
+          }, 200);
+          return prev;
+        }
+        const newState = {
+          ...prev,
+          players: [...prev.players, msg.player],
+        };
+        // broadcast AFTER React has committed the new state
+        setTimeout(() => {
+          peerRef.current?.broadcastGameState(newState);
+        }, 200);
+        return newState;
+      });
+      return;
+    }
+
     setGameState(prev => {
       if (!prev) return prev;
       let newState = prev;
 
       switch (msg.type) {
-        case 'player-join': {
-          const existingPlayer = prev.players.find(p => p.id === msg.player.id);
-          if (!existingPlayer) {
-            newState = {
-              ...prev,
-              players: [...prev.players, msg.player],
-            };
-          }
-          // Send current state to the new player
-          setTimeout(() => {
-            peerRef.current?.broadcastGameState(newState);
-          }, 100);
-          break;
-        }
         case 'submit-proposal': {
           newState = submitProposal(prev, msg.playerId, msg.proposal);
           peerRef.current?.broadcastGameState(newState);
@@ -103,19 +118,20 @@ export default function Home() {
     });
   }, []);
 
-  // Client message handler
+  // Client message handler — uses ref for myPlayerId to avoid stale closure
   const handleClientMessage = useCallback((msg: PeerMessage, _senderId: string) => {
     switch (msg.type) {
       case 'game-state': {
         const newState = deserializeGameState(msg.state);
         setGameState(prev => {
+          const currentMyId = myPlayerIdRef.current;
           // Preserve our own hand if we are a non-judge player
-          if (prev) {
-            const myPlayerInNew = newState.players.find(p => p.id === myPlayerId);
-            const myPlayerInOld = prev.players.find(p => p.id === myPlayerId);
+          if (prev && currentMyId) {
+            const myPlayerInNew = newState.players.find(p => p.id === currentMyId);
+            const myPlayerInOld = prev.players.find(p => p.id === currentMyId);
             if (myPlayerInNew && myPlayerInOld && myPlayerInOld.hand.length > 0 && myPlayerInNew.hand.length === 0) {
               newState.players = newState.players.map(p =>
-                p.id === myPlayerId ? { ...p, hand: myPlayerInOld.hand } : p
+                p.id === currentMyId ? { ...p, hand: myPlayerInOld.hand } : p
               );
             }
           }
@@ -126,7 +142,7 @@ export default function Home() {
       default:
         break;
     }
-  }, [myPlayerId]);
+  }, []); // No dependencies — uses ref instead
 
   // Create room
   const handleCreateRoom = useCallback(async (playerName: string) => {
@@ -145,6 +161,9 @@ export default function Home() {
       const initialState = createInitialGameState(roomId);
       initialState.players = [player];
 
+      // Set refs immediately (state updates are async)
+      myPlayerIdRef.current = playerId;
+      
       setMyPlayerId(playerId);
       setIsHost(true);
       setGameState(initialState);
@@ -179,10 +198,16 @@ export default function Home() {
       const peer = new PeerManager();
       peerRef.current = peer;
 
+      // Set message handler BEFORE connecting so it's ready when messages arrive
+      peer.setOnMessage(handleClientMessage);
+
       await peer.initAsClient(roomId.toUpperCase());
       
       const playerId = peer.getPeerId();
       const player = createPlayer(playerId, playerName, false);
+
+      // Set ref immediately
+      myPlayerIdRef.current = playerId;
 
       setMyPlayerId(playerId);
       setIsHost(false);
@@ -191,10 +216,10 @@ export default function Home() {
       initialState.players = [player];
       setGameState(initialState);
 
-      peer.setOnMessage(handleClientMessage);
-
-      // Send join message to host
-      peer.sendToHost({ type: 'player-join', player });
+      // Send join message to host with a small delay to ensure host has handlers ready
+      setTimeout(() => {
+        peer.sendToHost({ type: 'player-join', player });
+      }, 300);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : '部屋への参加に失敗しました。');
       peerRef.current?.destroy();
@@ -263,6 +288,7 @@ export default function Home() {
     peerRef.current = null;
     setGameState(null);
     setMyPlayerId('');
+    myPlayerIdRef.current = '';
     setIsHost(false);
     setError('');
   }, []);

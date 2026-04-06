@@ -1,7 +1,7 @@
 'use client';
 
 import Peer, { DataConnection } from 'peerjs';
-import { PeerMessage, GameState, SerializedGameState, Player, serializeGameState, deserializeGameState } from './gameState';
+import { PeerMessage, GameState, serializeGameState } from './gameState';
 
 type MessageHandler = (msg: PeerMessage, senderId: string) => void;
 type ConnectionHandler = (peerId: string) => void;
@@ -42,7 +42,6 @@ export class PeerManager {
 
       this.peer.on('error', (err) => {
         console.error('Peer error:', err);
-        // If ID is taken, the room might already exist
         if (err.type === 'unavailable-id') {
           reject(new Error('この部屋コードは既に使われています。別のコードをお試しください。'));
         } else {
@@ -102,11 +101,20 @@ export class PeerManager {
   }
 
   private handleConnection(conn: DataConnection) {
-    conn.on('open', () => {
+    // 着信接続がすでにopenの場合があるので両方対応する
+    const setup = () => {
+      if (this.connections.has(conn.peer)) return; // 重複防止
       console.log('New connection from:', conn.peer);
       this.connections.set(conn.peer, conn);
       this.setupConnectionHandlers(conn);
       this.onConnect?.(conn.peer);
+    };
+
+    if (conn.open) {
+      setup();
+    }
+    conn.on('open', () => {
+      setup();
     });
   }
 
