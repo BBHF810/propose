@@ -7,7 +7,20 @@ type MessageHandler = (msg: PeerMessage, senderId: string) => void;
 type ConnectionHandler = (peerId: string) => void;
 type DisconnectionHandler = (peerId: string) => void;
 
-const PEER_PREFIX = 'propose-game-';
+const PEER_PREFIX = 'propgame-';
+
+// PeerJSの共通設定
+const PEER_CONFIG = {
+  debug: 2,
+  config: {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun.services.mozilla.com' },
+    ],
+  },
+};
 
 export class PeerManager {
   private peer: Peer | null = null;
@@ -18,6 +31,7 @@ export class PeerManager {
   private isHost: boolean = false;
   private myPeerId: string = '';
   private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private destroyed: boolean = false;
 
   // ホストとして初期化
   async initAsHost(roomId: string): Promise<string> {
@@ -26,28 +40,49 @@ export class PeerManager {
     this.myPeerId = peerId;
 
     return new Promise((resolve, reject) => {
-      this.peer = new Peer(peerId, {
-        debug: 1,
-      });
+      let resolved = false;
+
+      this.peer = new Peer(peerId, PEER_CONFIG);
 
       this.peer.on('open', (id) => {
-        console.log('Host peer opened:', id);
+        if (resolved) return;
+        resolved = true;
+        console.log('[Host] Peer opened:', id);
         this.startPingInterval();
         resolve(id);
       });
 
       this.peer.on('connection', (conn) => {
+        console.log('[Host] Incoming connection from:', conn.peer);
         this.handleConnection(conn);
       });
 
-      this.peer.on('error', (err) => {
-        console.error('Peer error:', err);
-        if (err.type === 'unavailable-id') {
-          reject(new Error('この部屋コードは既に使われています。別のコードをお試しください。'));
-        } else {
-          reject(err);
+      this.peer.on('error', (err: any) => {
+        console.error('[Host] Peer error:', err.type, err.message);
+        if (!resolved) {
+          resolved = true;
+          if (err.type === 'unavailable-id') {
+            reject(new Error('この部屋コードは既に使われています。別のコードをお試しください。'));
+          } else {
+            reject(new Error(`接続エラー: ${err.type || err.message}`));
+          }
         }
       });
+
+      this.peer.on('disconnected', () => {
+        console.log('[Host] Disconnected from signaling server, attempting reconnect...');
+        if (!this.destroyed && this.peer) {
+          this.peer.reconnect();
+        }
+      });
+
+      // タイムアウト
+      setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          reject(new Error('シグナリングサーバーへの接続がタイムアウトしました。'));
+        }
+      }, 15000);
     });
   }
 
@@ -57,19 +92,25 @@ export class PeerManager {
     const hostPeerId = PEER_PREFIX + roomId;
 
     return new Promise((resolve, reject) => {
-      this.peer = new Peer({
-        debug: 1,
-      });
+      let resolved = false;
+
+      this.peer = new Peer(PEER_CONFIG);
 
       this.peer.on('open', (id) => {
-        console.log('Client peer opened:', id);
+        console.log('[Client] Peer opened:', id);
         this.myPeerId = id;
 
+        console.log('[Client] Connecting to host:', hostPeerId);
         // ホストに接続
-        const conn = this.peer!.connect(hostPeerId, { reliable: true });
-        
+        const conn = this.peer!.connect(hostPeerId, {
+          reliable: true,
+          serialization: 'json',
+        });
+
         conn.on('open', () => {
-          console.log('Connected to host');
+          if (resolved) return;
+          resolved = true;
+          console.log('[Client] Connected to host successfully');
           this.connections.set(hostPeerId, conn);
           this.setupConnectionHandlers(conn);
           this.startPingInterval();
@@ -77,26 +118,49 @@ export class PeerManager {
         });
 
         conn.on('error', (err) => {
-          console.error('Connection error:', err);
-          reject(new Error('部屋に接続できませんでした。部屋コードを確認してください。'));
+          console.error('[Client] Connection error:', err);
+          if (!resolved) {
+            resolved = true;
+            reject(new Error('部屋に接続できませんでした。部屋コードを確認してください。'));
+          }
         });
 
-        // Timeout for connection
+        // 接続タイムアウト
         setTimeout(() => {
-          if (!conn.open) {
+          if (!resolved) {
+            resolved = true;
+            console.error('[Client] Connection timeout. conn.open:', conn.open);
             reject(new Error('接続がタイムアウトしました。部屋コードを確認してください。'));
           }
-        }, 10000);
+        }, 15000);
       });
 
-      this.peer.on('error', (err) => {
-        console.error('Peer error:', err);
-        if (err.type === 'peer-unavailable') {
-          reject(new Error('部屋が見つかりません。部屋コードを確認してください。'));
-        } else {
-          reject(err);
+      this.peer.on('error', (err: any) => {
+        console.error('[Client] Peer error:', err.type, err.message);
+        if (!resolved) {
+          resolved = true;
+          if (err.type === 'peer-unavailable') {
+            reject(new Error('部屋が見つかりません。部屋コードを確認してください。'));
+          } else {
+            reject(new Error(`接続エラー: ${err.type || err.message}`));
+          }
         }
       });
+
+      this.peer.on('disconnected', () => {
+        console.log('[Client] Disconnected from signaling server');
+        if (!this.destroyed && this.peer) {
+          this.peer.reconnect();
+        }
+      });
+
+      // Peer自体のオープンタイムアウト
+      setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          reject(new Error('シグナリングサーバーに接続できませんでした。ネットワークを確認してください。'));
+        }
+      }, 20000);
     });
   }
 
@@ -104,16 +168,18 @@ export class PeerManager {
     // 着信接続がすでにopenの場合があるので両方対応する
     const setup = () => {
       if (this.connections.has(conn.peer)) return; // 重複防止
-      console.log('New connection from:', conn.peer);
+      console.log('[PeerManager] Setting up connection with:', conn.peer, 'open:', conn.open);
       this.connections.set(conn.peer, conn);
       this.setupConnectionHandlers(conn);
       this.onConnect?.(conn.peer);
     };
 
     if (conn.open) {
+      console.log('[PeerManager] Connection already open:', conn.peer);
       setup();
     }
     conn.on('open', () => {
+      console.log('[PeerManager] Connection opened:', conn.peer);
       setup();
     });
   }
@@ -126,17 +192,18 @@ export class PeerManager {
         return;
       }
       if (msg.type === 'pong') return;
+      console.log('[PeerManager] Received message:', msg.type, 'from:', conn.peer);
       this.onMessage?.(msg, conn.peer);
     });
 
     conn.on('close', () => {
-      console.log('Connection closed:', conn.peer);
+      console.log('[PeerManager] Connection closed:', conn.peer);
       this.connections.delete(conn.peer);
       this.onDisconnect?.(conn.peer);
     });
 
     conn.on('error', (err) => {
-      console.error('Connection error with', conn.peer, err);
+      console.error('[PeerManager] Connection error with', conn.peer, err);
     });
   }
 
@@ -145,12 +212,14 @@ export class PeerManager {
     const conn = this.connections.get(peerId);
     if (conn && conn.open) {
       conn.send(msg);
+    } else {
+      console.warn('[PeerManager] Cannot send to', peerId, '- connection not open');
     }
   }
 
   // 全ピアにブロードキャスト
   broadcast(msg: PeerMessage) {
-    this.connections.forEach((conn) => {
+    this.connections.forEach((conn, peerId) => {
       if (conn.open) {
         conn.send(msg);
       }
@@ -167,7 +236,10 @@ export class PeerManager {
   sendToHost(msg: PeerMessage) {
     const hostConn = Array.from(this.connections.values())[0];
     if (hostConn && hostConn.open) {
+      console.log('[Client] Sending to host:', msg.type);
       hostConn.send(msg);
+    } else {
+      console.warn('[Client] Cannot send to host - no open connection');
     }
   }
 
@@ -193,6 +265,7 @@ export class PeerManager {
 
   // 切断
   destroy() {
+    this.destroyed = true;
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
     }
