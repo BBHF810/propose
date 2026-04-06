@@ -112,11 +112,19 @@ export default function TopPage({ onCreateRoom, onJoinRoom, error, isConnecting 
               <input
                 id="room-code"
                 type="text"
+                inputMode="text"
                 placeholder="例：AB12"
                 value={roomCode}
-                onChange={(e) => setRoomCode(e.target.value.toUpperCase())}
+                onChange={(e) => {
+                  const val = e.target.value.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+                  setRoomCode(val.slice(0, 4));
+                }}
                 maxLength={4}
                 className="room-code-input"
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="characters"
+                spellCheck={false}
                 onKeyDown={(e) => e.key === 'Enter' && handleJoin()}
               />
             </div>
@@ -275,11 +283,12 @@ export default function TopPage({ onCreateRoom, onJoinRoom, error, isConnecting 
 
         .room-code-input {
           text-align: center;
-          font-size: 1.8rem !important;
-          letter-spacing: 0.5em;
+          font-size: 1.6rem !important;
+          letter-spacing: 0.3em;
           font-family: var(--font-display);
           font-weight: 700;
-          text-transform: uppercase;
+          padding-right: 0.3em;
+          -webkit-text-security: none;
         }
 
         .form-actions {
